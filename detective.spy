@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+
+"""
+Real-Time Log Analyzer & Automated Threat Detector
+
+Educational defensive-security project.
+
+Monitors a log file, parses authentication events, and raises alerts
+when configurable suspicious patterns are observed.
+
+No external Python packages are required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------
+# Log patterns
+# ---------------------------------------------------------------------
+
+FAILED_LOGIN_PATTERNS = [
+    re.compile(
+        r"Failed password for (?:invalid user )?"
+        r"(?P<user>\S+) from "
+        r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})"
+    ),
+    re.compile(
+        r"authentication failure.*"
+        r"rhost=(?P<ip>\d{1,3}(?:\.\d{1,3}){3}).*"
+        r"user=(?P<user>\S+)"
+    ),
+]
+
+SUCCESS_LOGIN_PATTERN = re.compile(
+    r"Accepted (?:password|publickey) for "
+    r"(?P<user>\S+) from "
+    r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})"
+)
+
+INVALID_USER_PATTERN = re.compile(
+    r"Invalid user "
+    r"(?P<user>\S+) from "
+    r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})"
+)
+
+IP_PATTERN = re.compile(
+    r"\b(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\b"
+)
+
+
+# ---------------------------------------------------------------------
+# Event model
+# ---------------------------------------------------------------------
+
+@dataclass
+class Event:
+    timestamp: str
+    event_type: str
+    source_ip: str | None
+    username: str | None
+    raw: str
+
+
+# ---------------------------------------------------------------------
+# Threat detector
+# ---------------------------------------------------------------------
+
+class ThreatDetector:
+    """
+    Detect simple, explainable authentication-related indicators.
+    """
+
+    def __init__(self, threshold: int = 5, window_seconds: int = 120):
+        self.threshold = threshold
+        self.window = timedelta(seconds=window_seconds)
+
+        self.failed_attempts = defaultdict(deque)
+        self.alerted_bruteforce = set()
+
+    def process(self, event: Event) -> list[dict]:
+        alerts = []
+
+        try:
+            event_time = datetime.fromisoformat(event.timestamp)
+        except ValueError:
+            event_time = datetime.now()
+
+        # -------------------------------------------------------------
+        # Possible brute-force detection
+        # -------------------------------------------------------------
+
+        if event.event_type == "FAILED_LOGIN" and event.source_ip:
+
+            attempts = self.failed_attempts[event.source_ip]
+
+            attempts.append(event_time)
+
+            cutoff = event_time - self.window
+
+            while attempts and attempts[0] < cutoff:
+                attempts.popleft()
+
+            if (
+                len(attempts) >= self.threshold
+                and event.source_ip not in self.alerted_bruteforce
+            ):
+
+                self.alerted_bruteforce.add(event.source_ip)
+
+                alerts.append(
+                    {
+                        "alert_type": "POSSIBLE_BRUTE_FORCE",
+                        "severity": "HIGH",
+                        "source_ip": event.source_ip,
+                        "failed_attempts": len(attempts),
+                        "window_seconds": int(
+                            self.window.total_seconds()
+                        ),
+                        "message": (
+                            f"{len(attempts)} failed login attempts "
+                            f"from {event.source_ip} within "
+                            f"{int(self.window.total_seconds())} seconds."
+                        ),
+                    }
+                )
+
+        # -------------------------------------------------------------
+        # Invalid username detection
+        # -------------------------------------------------------------
+
+        if event.event_type == "INVALID_USER":
+
+            alerts.append(
+                {
+                    "alert_type": "INVALID_USER_ATTEMPT",
+                    "severity": "MEDIUM",
+                    "source_ip": event.source_ip,
+                    "username": event.username,
+                    "message": (
+                        "An authentication attempt used a "
+                        "non-existent username."
+                    ),
+                }
+            )
+
+        return alerts
+
+
+# ---------------------------------------------------------------------
+# Log parser
+# ---------------------------------------------------------------------
+
+def parse_log_line(line: str) -> Event | None:
+    """
+    Convert a raw log line into a normalized Event.
+    """
+
+    line = line.strip()
+
+    if not line:
+        return None
+
+    timestamp = datetime.now().isoformat(timespec="seconds")
+
+    # Failed login
+    for pattern in FAILED_LOGIN_PATTERNS:
+
+        match = pattern.search(line)
+
+        if match:
+            return Event(
+                timestamp=timestamp,
+                event_type="FAILED_LOGIN",
+                source_ip=match.group("ip"),
+                username=match.group("user"),
+                raw=line,
+            )
+
+    # Invalid username
+    match = INVALID_USER_PATTERN.search(line)
+
+    if match:
+        return Event(
+            timestamp=timestamp,
+            event_type="INVALID_USER",
+            source_ip=match.group("ip"),
+            username=match.group("user"),
+            raw=line,
+        )
+
+    # Successful login
+    match = SUCCESS_LOGIN_PATTERN.search(line)
+
+    if match:
+        return Event(
+            timestamp=timestamp,
+            event_type="SUCCESS_LOGIN",
+            source_ip=match.group("ip"),
+            username=match.group("user"),
+            raw=line,
+        )
+
+    # Other event
+    ip_match = IP_PATTERN.search(line)
+
+    return Event(
+        timestamp=timestamp,
+        event_type="OTHER",
+        source_ip=ip_match.group("ip") if ip_match else None,
+        username=None,
+        raw=line,
+    )
+
+
+# ---------------------------------------------------------------------
+# Output functions
+# ---------------------------------------------------------------------
+
+def print_event(event: Event) -> None:
+
+    print(
+        f"[EVENT] {event.event_type:<15} "
+        f"IP={event.source_ip or '-':<15} "
+        f"USER={event.username or '-'}"
+    )
+
+
+def print_alert(alert: dict) -> None:
+
+    print("\n" + "=" * 64)
+    print("🚨 SECURITY ALERT")
+    print("=" * 64)
+
+    print(f"Type:       {alert['alert_type']}")
+    print(f"Severity:   {alert['severity']}")
+    print(f"Source IP:  {alert.get('source_ip', '-')}")
+
+    if "username" in alert:
+        print(f"Username:   {alert['username']}")
+
+    if "failed_attempts" in alert:
+        print(f"Attempts:   {alert['failed_attempts']}")
+
+    print(f"Message:    {alert['message']}")
+
+    print("=" * 64 + "\n")
+
+
+def save_alert(alert: dict, output_file: Path) -> None:
+    """
+    Append alerts to a JSON Lines file.
+    """
+
+    output_file.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    record = {
+        "timestamp": datetime.now().isoformat(
+            timespec="seconds"
+        ),
+        **alert,
+    }
+
+    with output_file.open(
+        "a",
+        encoding="utf-8"
+    ) as file:
+
+        file.write(
+            json.dumps(record) + "\n"
+        )
+
+
+# ---------------------------------------------------------------------
+# Real-time monitoring
+# ---------------------------------------------------------------------
+
+def follow_file(
+    log_file: Path,
+    detector: ThreatDetector,
+    alert_file: Path,
+) -> None:
+
+    """
+    Follow a growing log file, similar to `tail -f`.
+    """
+
+    with log_file.open(
+        "r",
+        encoding="utf-8",
+        errors="replace",
+    ) as file:
+
+        # Start at the end of the file.
+        file.seek(0, 2)
+
+        print(f"[+] Monitoring: {log_file}")
+        print(
+            "[+] Waiting for new log entries..."
+        )
+        print(
+            "[+] Press Ctrl+C to stop.\n"
+        )
+
+        while True:
+
+            line = file.readline()
+
+            if not line:
+
+                time.sleep(0.5)
+                continue
+
+            event = parse_log_line(line)
+
+            if event is None:
+                continue
+
+            print_event(event)
+
+            alerts = detector.process(event)
+
+            for alert in alerts:
+
+                print_alert(alert)
+
+                save_alert(
+                    alert,
+                    alert_file
+                )
+
+
+# ---------------------------------------------------------------------
+# Analyze existing logs
+# ---------------------------------------------------------------------
+
+def analyze_existing_file(
+    log_file: Path,
+    detector: ThreatDetector,
+    alert_file: Path,
+) -> None:
+
+    """
+    Analyze all currently available log lines once.
+    """
+
+    with log_file.open(
+        "r",
+        encoding="utf-8",
+        errors="replace",
+    ) as file:
+
+        for line in file:
+
+            event = parse_log_line(line)
+
+            if event is None:
+                continue
+
+            print_event(event)
+
+            alerts = detector.process(event)
+
+            for alert in alerts:
+
+                print_alert(alert)
+
+                save_alert(
+                    alert,
+                    alert_file
+                )
+
+
+# ---------------------------------------------------------------------
+# Main program
+# ---------------------------------------------------------------------
+
+def main() -> None:
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Real-Time Log Analyzer & "
+            "Automated Threat Detector"
+        )
+    )
+
+    parser.add_argument(
+        "log_file",
+        type=Path,
+        help="Path to the log file to monitor.",
+    )
+
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=5,
+        help=(
+            "Failed attempts required for a "
+            "brute-force alert. Default: 5"
+        ),
+    )
+
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=120,
+        help=(
+            "Detection window in seconds. "
+            "Default: 120"
+        ),
+    )
+
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help=(
+            "Analyze the existing log once "
+            "instead of monitoring continuously."
+        ),
+    )
+
+    parser.add_argument(
+        "--alerts",
+        type=Path,
+        default=Path("alerts.jsonl"),
+        help=(
+            "File where generated alerts "
+            "are stored."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if args.threshold < 1:
+
+        parser.error(
+            "--threshold must be greater than zero."
+        )
+
+    if args.window < 1:
+
+        parser.error(
+            "--window must be greater than zero."
+        )
+
+    if not args.log_file.is_file():
+
+        parser.error(
+            f"Log file does not exist: "
+            f"{args.log_file}"
+        )
+
+    detector = ThreatDetector(
+        threshold=args.threshold,
+        window_seconds=args.window,
+    )
+
+    try:
+
+        if args.once:
+
+            analyze_existing_file(
+                args.log_file,
+                detector,
+                args.alerts,
+            )
+
+        else:
+
+            follow_file(
+                args.log_file,
+                detector,
+                args.alerts,
+            )
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n[+] Monitoring stopped safely."
+        )
+
+
+if __name__ == "__main__":
+    main()
